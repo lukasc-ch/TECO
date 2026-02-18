@@ -1,1 +1,1 @@
-# TECA
+# TECO -- The Experienced Code Optimizer
