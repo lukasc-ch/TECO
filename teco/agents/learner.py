@@ -16,6 +16,5 @@ from teco.orchestration.context import OptimizationContext
 class LearnerAgent(BaseAgent):
     def run(self, context: OptimizationContext) -> OptimizationContext:
         # Stub: no-op until Phase 2
-        if context.verbose:
-            print("[LearnerAgent] Stub — skipping (Phase 2 not yet implemented)")
+        context.log("[LearnerAgent] Stub — skipping (Phase 2 not yet implemented)", level=2)
         return context

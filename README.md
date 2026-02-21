@@ -56,7 +56,9 @@ uv run teco optimize path/to/kernel.py --verbose                                
 uv run teco optimize TritonBench/data/TritonBench_G_v1/lightning_attention.py     # TritonBench example
 uv run teco query a100-sxm4-80gb --tags attention,softmax                         # query knowledge base
 
-uv run pytest tests/test_knowledge_store.py tests/test_compiler.py               # tests (no GPU needed)
+ uv run teco optimize TritonBench/data/TritonBench_G_v1/max_reduction.py --verbosity 3 # output all info
+
+
 uv run pytest                                                                     # full test suite (GPU)
 ```
 

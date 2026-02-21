@@ -5,6 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
+from teco.config import LLMConfig, llm_config
 from teco.orchestration.context import OptimizationContext
 
 
@@ -15,8 +16,10 @@ class BaseAgent(ABC):
     Agents are stateless — all state lives in OptimizationContext.
     """
 
-    def __init__(self, model_id: str = "claude-opus-4-6") -> None:
-        self.model_id = model_id
+    def __init__(self, model_id: str | None = None, config: LLMConfig | None = None) -> None:
+        self._config = config or llm_config
+        # model_id argument overrides config (e.g. when passed via CLI --model flag)
+        self.model_id = model_id or self._config.model
 
     @abstractmethod
     def run(self, context: OptimizationContext) -> OptimizationContext:
@@ -28,9 +31,7 @@ class BaseAgent(ABC):
         Used for structured reasoning tasks (strategy planning, reflection).
         Returns the text content of the first text block.
         """
-        import anthropic
-
-        client = anthropic.Anthropic()
+        client = self._config.anthropic_client()
         response = client.messages.create(
             model=self.model_id,
             max_tokens=kwargs.get("max_tokens", 4096),

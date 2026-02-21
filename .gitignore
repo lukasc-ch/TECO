@@ -211,3 +211,5 @@ uv.lock
 
 /*.html
 /.claude/
+/knowledge/
+/teco.toml

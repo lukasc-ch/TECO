@@ -9,8 +9,6 @@ import re
 import subprocess
 import sys
 import tempfile
-import textwrap
-import types
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -158,62 +156,111 @@ def _build_validation_script(
     atol: float,
     rtol: float,
 ) -> str:
-    """Build a self-contained Python script that validates candidate against reference."""
+    """Build a self-contained Python script that validates candidate against reference.
+
+    Each source is exec'd in its own namespace dict so kernel function names in the
+    candidate never overwrite those in the reference.  The test function found in each
+    namespace calls its own kernel via its own __globals__, giving true isolation without
+    any renaming heuristics.
+
+    Comparison is recursive so it handles dict values that are tensors, numpy arrays,
+    or arbitrarily-nested tuples/lists of the above (all common in TritonBench tests).
+    """
     ref_kernel = _extract_kernel_section(reference_source)
-    ref_test = _extract_test_section(reference_source)
+    ref_test = _strip_module_level_statements(_extract_test_section(reference_source))
     cand_kernel = _extract_kernel_section(candidate_source)
-    cand_test = _extract_test_section(candidate_source)
+    cand_test = _strip_module_level_statements(_extract_test_section(candidate_source))
 
-    # Rename functions in candidate to avoid collisions
-    cand_kernel_renamed = _namespace_functions(cand_kernel, prefix="cand_")
-    cand_test_renamed = _namespace_functions(cand_test, prefix="cand_")
+    ref_full = ref_kernel + "\n" + ref_test
+    cand_full = cand_kernel + "\n" + cand_test
 
-    return textwrap.dedent(f"""\
-        import torch
-        import sys
-
-        # ---- Reference kernel ----
-        {textwrap.indent(ref_kernel, '        ').strip()}
-
-        # ---- Reference test ----
-        {textwrap.indent(ref_test, '        ').strip()}
-
-        # ---- Candidate kernel (namespaced) ----
-        {textwrap.indent(cand_kernel_renamed, '        ').strip()}
-
-        # ---- Candidate test (namespaced) ----
-        {textwrap.indent(cand_test_renamed, '        ').strip()}
-
-        # ---- Validation ----
-        try:
-            ref_fn = [v for k, v in list(locals().items()) + list(globals().items())
-                      if k.startswith('test_') and callable(v) and not k.startswith('test_cand_')]
-            cand_fn = [v for k, v in list(locals().items()) + list(globals().items())
-                       if k.startswith('cand_test_') and callable(v)]
-            if not ref_fn or not cand_fn:
-                print("ERROR: Could not find test functions", file=sys.stderr)
-                sys.exit(1)
-            ref_out = ref_fn[0]()
-            cand_out = cand_fn[0]()
-            if not isinstance(ref_out, dict) or not isinstance(cand_out, dict):
-                print("ERROR: test functions must return dict[str, Tensor]", file=sys.stderr)
-                sys.exit(1)
-            for key in ref_out:
-                r = ref_out[key]
-                c = cand_out.get(key)
-                if c is None:
-                    print(f"ERROR: candidate missing output key '{{key}}'", file=sys.stderr)
-                    sys.exit(1)
-                if not torch.allclose(r.float(), c.float(), atol={atol}, rtol={rtol}):
-                    max_diff = (r.float() - c.float()).abs().max().item()
-                    print(f"MISMATCH key='{{key}}' max_diff={{max_diff:.6f}} "
-                          f"atol={atol} rtol={rtol}", file=sys.stderr)
-                    sys.exit(1)
-            print("OK")
-        except Exception as e:
-            print(f"ERROR: {{e}}", file=sys.stderr)
-            sys.exit(1)
-    """)
+    lines = [
+        "import sys",
+        "import io",
+        "import os",
+        "import importlib.util",
+        "import tempfile",
+        "import torch",
+        "try:",
+        "    import numpy as _np",
+        "except ImportError:",
+        "    _np = None",
+        "",
+        f"_ATOL = {atol}",
+        f"_RTOL = {rtol}",
+        f"_REF_SOURCE = {repr(ref_full)}",
+        f"_CAND_SOURCE = {repr(cand_full)}",
+        "",
+        "def _to_tensor(x):",
+        "    if _np is not None and isinstance(x, _np.ndarray):",
+        "        return torch.from_numpy(x)",
+        "    return x",
+        "",
+        "def _compare(r, c, path=''):",
+        "    r, c = _to_tensor(r), _to_tensor(c)",
+        "    if isinstance(r, torch.Tensor):",
+        "        if not isinstance(c, torch.Tensor):",
+        "            raise AssertionError(f'Type mismatch at {path!r}: ref={type(r).__name__}, cand={type(c).__name__}')",
+        "        if not torch.allclose(r.float(), c.float(), atol=_ATOL, rtol=_RTOL):",
+        "            diff = (r.float() - c.float()).abs().max().item()",
+        "            raise AssertionError(f'MISMATCH at {path!r}: max_diff={diff:.6f}')",
+        "    elif isinstance(r, (list, tuple)):",
+        "        for i, (ri, ci) in enumerate(zip(r, c)):",
+        "            _compare(ri, ci, f'{path}[{i}]')",
+        "    # scalars / other non-tensor types: skip numeric comparison",
+        "",
+        # Load source from a real .py file so Triton @jit can read it via inspect.
+        # Stdout is redirected during exec_module to swallow TritonBench's
+        # module-level  result_gold = test_...()  / print(result_gold) calls.
+        "def _load_module(source, name):",
+        "    f = tempfile.NamedTemporaryFile(suffix='.py', mode='w', delete=False)",
+        "    f.write(source)",
+        "    f.close()",
+        "    spec = importlib.util.spec_from_file_location(name, f.name)",
+        "    mod = importlib.util.module_from_spec(spec)",
+        "    old = sys.stdout",
+        "    sys.stdout = io.StringIO()",
+        "    try:",
+        "        spec.loader.exec_module(mod)",
+        "    finally:",
+        "        sys.stdout = old",
+        "    return mod, f.name",
+        "",
+        "_ref_path = _cand_path = None",
+        "try:",
+        "    _ref_mod, _ref_path = _load_module(_REF_SOURCE, 'ref_kernel')",
+        "    _cand_mod, _cand_path = _load_module(_CAND_SOURCE, 'cand_kernel')",
+        "    _ref_fn = next((v for k, v in vars(_ref_mod).items() if k.startswith('test_') and callable(v)), None)",
+        "    _cand_fn = next((v for k, v in vars(_cand_mod).items() if k.startswith('test_') and callable(v)), None)",
+        "    if _ref_fn is None or _cand_fn is None:",
+        "        print('ERROR: Could not find test functions', file=sys.stderr)",
+        "        sys.exit(1)",
+        "    _ref_out = _ref_fn()",
+        "    _cand_out = _cand_fn()",
+        "    if not isinstance(_ref_out, dict) or not isinstance(_cand_out, dict):",
+        "        print('ERROR: test functions must return dict', file=sys.stderr)",
+        "        sys.exit(1)",
+        "    for _k in _ref_out:",
+        "        if _k not in _cand_out:",
+        "            print(f'ERROR: candidate missing key {_k!r}', file=sys.stderr)",
+        "            sys.exit(1)",
+        "        _compare(_ref_out[_k], _cand_out[_k], _k)",
+        "    print('OK')",
+        "except SystemExit:",
+        "    raise",
+        "except Exception as _e:",
+        "    import traceback",
+        "    print(f'ERROR: {_e}', file=sys.stderr)",
+        "    traceback.print_exc(file=sys.stderr)",
+        "    sys.exit(1)",
+        "finally:",
+        "    for _p in (_ref_path, _cand_path):",
+        "        if _p is not None:",
+        "            try: os.unlink(_p)",
+        "            except OSError: pass",
+        "",
+    ]
+    return "\n".join(lines) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -250,3 +297,41 @@ def _extract_test_section(source: str) -> str:
 def _namespace_functions(source: str, prefix: str) -> str:
     """Prefix all top-level function definitions with `prefix`."""
     return re.sub(r"^def (test_)", f"def {prefix}\\1", source, flags=re.MULTILINE)
+
+
+def _strip_module_level_statements(source: str) -> str:
+    """Remove module-level execution statements, keeping only definitions and imports.
+
+    TritonBench files always end the test section with lines like:
+        result_gold = test_...()
+        print(result_gold)
+    These must NOT run at module-load time because:
+    - They invoke the kernel (potentially OOM on restricted hardware)
+    - They execute twice (once at load, once when we call _ref_fn())
+
+    Uses AST to identify which lines belong to top-level function/class/import nodes
+    and discards everything else (bare expressions, assignments, etc.).
+    Falls back to the original source if parsing fails.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source
+
+    lines = source.splitlines(keepends=True)
+    keep: set[int] = set()
+    for node in tree.body:
+        if isinstance(
+            node,
+            (
+                ast.FunctionDef,
+                ast.AsyncFunctionDef,
+                ast.ClassDef,
+                ast.Import,
+                ast.ImportFrom,
+            ),
+        ):
+            for lineno in range(node.lineno, node.end_lineno + 1):
+                keep.add(lineno)  # 1-indexed
+
+    return "".join(line for i, line in enumerate(lines, 1) if i in keep)

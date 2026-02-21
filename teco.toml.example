@@ -1,0 +1,12 @@
+# TECO configuration — copy to teco.toml and fill in your values.
+# Settings here are overridden by environment variables (see below).
+#
+# Env vars:  TECO_MODEL, TECO_API_KEY, TECO_BASE_URL, ANTHROPIC_API_KEY, TECO_VERBOSITY
+
+[llm]
+model    = "claude-opus-4-6"      # any Anthropic model ID
+api_key  = ""                     # leave empty to use ANTHROPIC_API_KEY from env
+base_url = ""                     # override for proxies or local Anthropic-compatible APIs
+
+[output]
+verbosity = 1   # 0=quiet  1=normal  2=verbose (diffs, tables)  3=debug (full profiling dumps)

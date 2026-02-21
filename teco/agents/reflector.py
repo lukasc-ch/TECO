@@ -18,6 +18,5 @@ from teco.orchestration.context import OptimizationContext
 class ReflectorAgent(BaseAgent):
     def run(self, context: OptimizationContext) -> OptimizationContext:
         # Stub: logs a brief summary but does not synthesize lessons yet
-        if context.verbose:
-            print("[ReflectorAgent] Stub — run record written; lesson synthesis Phase 2")
+        context.log("[ReflectorAgent] Stub — run record written; lesson synthesis Phase 2", level=2)
         return context

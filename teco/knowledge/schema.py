@@ -163,6 +163,7 @@ class Strategy(BaseModel):
     shape_results: list[StrategyShapeResult] = Field(default_factory=list)
     current_code: str = ""  # latest implementation
     iterations_applied: int = 0
+    last_failure: str = ""  # compile/validation error from the most recent rejected attempt
 
 
 class StrategyTree(BaseModel):

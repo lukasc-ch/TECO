@@ -57,8 +57,13 @@ class OptimizationContext:
     ncu_output_dir: Path = field(default_factory=lambda: Path("knowledge/runs/ncu"))
 
     # ── Misc ─────────────────────────────────────────────────────────────────
-    verbose: bool = False
+    verbosity: int = 1  # 0=quiet  1=normal  2=verbose  3=debug
     extra: dict[str, Any] = field(default_factory=dict)
+
+    def log(self, msg: str, level: int = 1) -> None:
+        """Print msg if verbosity >= level."""
+        if self.verbosity >= level:
+            print(msg)
 
     def best_tflops_across_shapes(self) -> float:
         """Return the best TFLOPS achieved in Stage 1 across all shapes and strategies."""

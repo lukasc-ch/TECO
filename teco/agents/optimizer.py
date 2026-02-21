@@ -29,6 +29,7 @@ from teco.agents.base import BaseAgent
 from teco.knowledge.schema import (
     KernelCharacteristics,
     PatternObservation,
+    ProfilingReport,
     RunOutcome,
     RunRecord,
     ShapePoint,
@@ -70,7 +71,7 @@ class OptimizerAgent(BaseAgent):
         self.ncu_output_dir = ncu_output_dir or Path("knowledge/runs/ncu")
 
     def run(self, context: OptimizationContext) -> OptimizationContext:
-        print(f"[OptimizerAgent] Starting optimization: {context.task_name}")
+        context.log(f"[OptimizerAgent] Starting optimization: {context.task_name}")
 
         # ── INIT ─────────────────────────────────────────────────────────────
         context = self._init_phase(context)
@@ -91,7 +92,17 @@ class OptimizerAgent(BaseAgent):
     # ------------------------------------------------------------------
 
     def _init_phase(self, context: OptimizationContext) -> OptimizationContext:
-        print("[OptimizerAgent] Phase: INIT — profiling baseline")
+        context.log("[OptimizerAgent] Phase: INIT — profiling baseline")
+
+        # Show initial kernel source (level 2)
+        src_lines = context.kernel_source.splitlines()
+        if context.verbosity >= 2:
+            max_lines = 80
+            shown = src_lines[:max_lines]
+            context.log(f"\n[Initial kernel source — {context.kernel_path.name}]")
+            context.log("\n".join(shown), level=2)
+            if len(src_lines) > max_lines:
+                context.log(f"  ... ({len(src_lines)} lines total)", level=2)
 
         # Stage 1: latency across shape sweep
         baseline_s1: dict[str, dict[str, float]] = {}
@@ -120,6 +131,10 @@ class OptimizerAgent(BaseAgent):
                 flops, nbytes = self._estimate_flops_bytes(context, medium_shape)
                 report = merge_stage1_into_report(report, s1, flops, nbytes)
                 context.baseline_stage2[medium_shape.label] = report
+                context.log(_fmt_report(report), level=3)
+
+        # Print baseline performance table (level 1)
+        context.log(_fmt_baseline_table(context), level=1)
 
         # Extract kernel characteristics from code + profiling
         context.kernel_characteristics = self._extract_characteristics(context)
@@ -135,9 +150,9 @@ class OptimizerAgent(BaseAgent):
             bottleneck_hints=bn_hints,
         )
 
-        if context.verbose and context.knowledge_query.warnings:
+        if context.knowledge_query.warnings:
             for w in context.knowledge_query.warnings:
-                print(f"  [knowledge] WARNING: {w}")
+                context.log(f"  [knowledge] WARNING: {w}", level=1)
 
         return context
 
@@ -146,7 +161,7 @@ class OptimizerAgent(BaseAgent):
     # ------------------------------------------------------------------
 
     def _planning_phase(self, context: OptimizationContext) -> OptimizationContext:
-        print("[OptimizerAgent] Phase: STRATEGY PLANNING")
+        context.log("[OptimizerAgent] Phase: STRATEGY PLANNING")
 
         system = _SYSTEM_PROMPT.format(language=context.language)
         user = self._build_planning_prompt(context)
@@ -161,10 +176,7 @@ class OptimizerAgent(BaseAgent):
         )
         context.strategy_tree = tree
 
-        if context.verbose:
-            print(f"  Generated {len(strategies)} strategies:")
-            for s in strategies:
-                print(f"    [{s.id}] {s.name}: {s.predicted_winning_regime}")
+        context.log(_fmt_strategy_table(strategies), level=2)
 
         return context
 
@@ -178,7 +190,7 @@ class OptimizerAgent(BaseAgent):
         for iteration in range(context.max_iterations):
             context.iteration = iteration
             context.strategy_tree.iteration = iteration
-            print(f"\n[OptimizerAgent] Iteration {iteration + 1}/{context.max_iterations}")
+            context.log(f"\n[OptimizerAgent] Iteration {iteration + 1}/{context.max_iterations}")
 
             # 1. Re-score and prune strategies
             context = self._rescore_strategies(context)
@@ -187,31 +199,47 @@ class OptimizerAgent(BaseAgent):
                 s for s in context.strategy_tree.strategies if s.status == "active"
             ]
             if not active:
-                print("  All strategies resolved (winners + pruned). Done.")
+                context.log("  All strategies resolved (winners + pruned). Done.")
                 break
 
             # 2. Deepen the leading strategy
             leader = max(active, key=lambda s: s.llm_confidence)
-            print(f"  Leading strategy: [{leader.id}] {leader.name} (confidence {leader.llm_confidence:.2f})")
+            context.log(f"  Leading strategy: [{leader.id}] {leader.name} (confidence {leader.llm_confidence:.2f})")
 
             new_source, diff = self._deepen_strategy(leader, context)
             if not new_source:
-                print(f"  Failed to generate new code for [{leader.id}]. Skipping iteration.")
+                context.log(f"  Failed to generate new code for [{leader.id}]. Skipping iteration.")
                 continue
+
+            # Show proposed diff before compile (level 2)
+            if diff and context.verbosity >= 2:
+                diff_lines = diff.splitlines()
+                cap = 60
+                shown = "\n".join(diff_lines[:cap])
+                context.log(f"\n  [{leader.id}] Proposed changes (iteration {iteration + 1}):", level=2)
+                context.log(shown, level=2)
+                if len(diff_lines) > cap:
+                    context.log(f"  ... ({len(diff_lines) - cap} more lines)", level=2)
 
             # 3. Compile check
             compile_result = compile_check(new_source)
             if not compile_result.success:
-                print(f"  Compile check failed: {compile_result.error_message[:200]}")
+                msg = compile_result.error_message[:400]
+                context.log(f"  Compile check failed: {msg}")
                 leader.llm_confidence = max(0.0, leader.llm_confidence - 0.15)
+                leader.last_failure = f"Compile error:\n{msg}"
                 continue
 
             # 4. Correctness validation
             val_result = validate_correctness(context.kernel_source, new_source)
             if not val_result.success:
-                print(f"  Correctness validation failed: {val_result.error_message[:200]}")
+                msg = val_result.error_message[:600]
+                context.log(f"  Correctness validation failed: {msg}")
                 leader.llm_confidence = max(0.0, leader.llm_confidence - 0.20)
+                leader.last_failure = f"Correctness validation failed:\n{msg}"
                 continue
+
+            leader.last_failure = ""  # clear on success
 
             # 5. Stage 1 profile across shape sweep
             shape_results = self._profile_strategy_stage1(new_source, context)
@@ -221,12 +249,13 @@ class OptimizerAgent(BaseAgent):
 
             # Report per-shape progress
             best_tflops = max((r.achieved_tflops for r in shape_results), default=0.0)
-            print(f"  Best TFLOPS this iteration: {best_tflops:.1f}")
+            context.log(f"  Best TFLOPS this iteration: {best_tflops:.1f}")
+            context.log(_fmt_shape_results(shape_results), level=2)
 
             # 6. Check efficiency ceiling
             eff = context.efficiency_pct(best_tflops)
             if eff >= context.target_efficiency_pct:
-                print(f"  Reached {eff:.1f}% of hardware ceiling. Stopping.")
+                context.log(f"  Reached {eff:.1f}% of hardware ceiling. Stopping.")
                 break
 
             # 7. Plateau detection
@@ -236,7 +265,7 @@ class OptimizerAgent(BaseAgent):
             else:
                 consecutive_plateau = 0
             if consecutive_plateau >= 2:
-                print("  Plateau detected (2 consecutive iterations < 2% improvement). Stopping.")
+                context.log("  Plateau detected (2 consecutive iterations < 2% improvement). Stopping.")
                 break
 
         return context
@@ -246,7 +275,7 @@ class OptimizerAgent(BaseAgent):
     # ------------------------------------------------------------------
 
     def _finalise(self, context: OptimizationContext) -> OptimizationContext:
-        print("\n[OptimizerAgent] Phase: FINALISE")
+        context.log("\n[OptimizerAgent] Phase: FINALISE")
 
         tree = context.strategy_tree
         # Mark regime winners from strategies with shape results
@@ -270,6 +299,7 @@ class OptimizerAgent(BaseAgent):
                 label=f"{context.run_id}_{strategy.id}_{best_shape.label}",
             )
             if report and strategy.shape_results:
+                context.log(_fmt_report(report), level=3)
                 # Attach to matching result
                 for result in strategy.shape_results:
                     if result.shape_point.label == best_shape.label:
@@ -287,7 +317,7 @@ class OptimizerAgent(BaseAgent):
         if dispatch_logic and len(regime_winners) > 1:
             val = validate_correctness(context.kernel_source, dispatch_logic)
             if not val.success:
-                print(f"  WARNING: dispatch wrapper validation failed: {val.error_message[:200]}")
+                context.log(f"  WARNING: dispatch wrapper validation failed: {val.error_message[:200]}")
 
         # Compute outcome
         overall_speedup = self._compute_overall_speedup(context)
@@ -356,8 +386,8 @@ class OptimizerAgent(BaseAgent):
                 run_record=run_record,
             )
 
-        print(f"\n[OptimizerAgent] Done. Overall speedup: {overall_speedup:.2f}x")
-        print(f"  Run record: knowledge/runs/{run_record.id}.json")
+        context.log(f"\n[OptimizerAgent] Done. Overall speedup: {overall_speedup:.2f}x")
+        context.log(f"  Run record: knowledge/runs/{run_record.id}.json")
         return context
 
     # ------------------------------------------------------------------
@@ -456,6 +486,18 @@ class OptimizerAgent(BaseAgent):
             )
             shape_perf = f"\n## Current performance of this strategy\n{rows}\n"
 
+        failure_section = ""
+        if strategy.last_failure:
+            failure_section = textwrap.dedent(f"""\
+
+                ## IMPORTANT: previous attempt was rejected
+                Your last generated code was rejected with this error — you MUST fix it:
+                ```
+                {strategy.last_failure[:800]}
+                ```
+                Diagnose the root cause and produce a corrected version.
+            """)
+
         return textwrap.dedent(f"""\
             ## Strategy to implement / refine
             Name: {strategy.name}
@@ -464,7 +506,7 @@ class OptimizerAgent(BaseAgent):
             Predicted winning regime: {strategy.predicted_winning_regime}
             Implementation sketch: {strategy.implementation_sketch}
             Iteration: {strategy.iterations_applied + 1}
-            {shape_perf}
+            {shape_perf}{failure_section}
             ## Current kernel source
             ```python
             {strategy.current_code or context.kernel_source}
@@ -592,8 +634,7 @@ class OptimizerAgent(BaseAgent):
                     tree.regime_winners[strategy.id] = desc
                     tree.active_ids = [i for i in tree.active_ids if i != strategy.id]
         except Exception as e:
-            if context.verbose:
-                print(f"  [rescore] Warning: could not parse response: {e}")
+            context.log(f"  [rescore] Warning: could not parse response: {e}", level=2)
 
         return context
 
@@ -931,6 +972,88 @@ class OptimizerAgent(BaseAgent):
                     llm_confidence=0.3,
                 )
             ]
+
+
+# ---------------------------------------------------------------------------
+# Verbosity formatting helpers
+# ---------------------------------------------------------------------------
+
+
+def _fmt_baseline_table(context: "OptimizationContext") -> str:  # type: ignore[name-defined]
+    """Format baseline Stage 1 performance as a compact table (level 1)."""
+    lines = ["\n[Baseline performance]",
+             f"  {'Shape':<10}  {'Latency (ms)':>12}  {'TFLOPS':>8}"]
+    lines.append("  " + "─" * 34)
+    for shape in context.shape_sweep:
+        m = context.baseline_stage1.get(shape.label, {})
+        lat = m.get("latency_ms", 0.0)
+        tfl = m.get("tflops", 0.0)
+        lines.append(f"  {shape.label:<10}  {lat:>12.2f}  {tfl:>8.1f}")
+    # Append Stage 2 bottleneck summary if available
+    rep = context.baseline_stage2.get("medium") or (
+        next(iter(context.baseline_stage2.values()), None) if context.baseline_stage2 else None
+    )
+    if rep is not None:
+        lines.append(
+            f"  Bottleneck (medium): {rep.bottleneck}"
+            f"  |  tensor-core util: {rep.tensor_core_utilization:.1%}"
+            f"  |  occupancy: {rep.achieved_occupancy:.1%}"
+        )
+        lines.append(
+            f"  DRAM: {rep.dram_bandwidth_gbs:.0f} GB/s (peak {rep.peak_bandwidth_gbs:.0f})"
+            f"  |  L1: {rep.l1_hit_rate:.0%}  |  L2: {rep.l2_hit_rate:.0%}"
+            f"  |  warp eff: {rep.warp_efficiency:.0%}"
+        )
+    return "\n".join(lines)
+
+
+def _fmt_strategy_table(strategies: "list[Strategy]") -> str:  # type: ignore[name-defined]
+    """Format strategy overview as a table (level 2)."""
+    lines = ["\n[Strategies generated]",
+             f"  {'ID':<4}  {'Name':<28}  {'Family':<20}  {'Predicted regime':<24}  {'Conf':>4}"]
+    lines.append("  " + "─" * 85)
+    for s in strategies:
+        lines.append(
+            f"  {s.id:<4}  {s.name[:28]:<28}  {s.family[:20]:<20}"
+            f"  {s.predicted_winning_regime[:24]:<24}  {s.llm_confidence:>4.2f}"
+        )
+    return "\n".join(lines)
+
+
+def _fmt_shape_results(results: "list[StrategyShapeResult]") -> str:  # type: ignore[name-defined]
+    """Format per-shape profiling results as a compact table (level 2)."""
+    lines = [f"  {'Shape':<10}  {'TFLOPS':>8}  {'vs baseline':>12}"]
+    lines.append("  " + "─" * 34)
+    for r in results:
+        lines.append(
+            f"  {r.shape_point.label:<10}  {r.achieved_tflops:>8.1f}  {r.vs_baseline_pct:>+11.1f}%"
+        )
+    return "\n".join(lines)
+
+
+def _fmt_report(report: "ProfilingReport") -> str:  # type: ignore[name-defined]
+    """Format a full ProfilingReport for debug output (level 3)."""
+    r = report
+    lines = [
+        "  [ProfilingReport]",
+        f"  Roofline:  {r.achieved_tflops:.1f} TFLOPS / peak {r.peak_tflops:.0f}"
+        f"  |  arith intensity {r.arithmetic_intensity:.2f} FLOP/byte"
+        f"  |  bottleneck: {r.bottleneck}  |  utilization {r.utilization_pct:.1%}",
+        f"  Memory:    L1 {r.l1_hit_rate:.1%}  L2 {r.l2_hit_rate:.1%}"
+        f"  |  DRAM {r.dram_bandwidth_gbs:.0f} GB/s (peak {r.peak_bandwidth_gbs:.0f})"
+        f"  |  bank conflicts {r.shared_mem_bank_conflicts}",
+        f"             global load eff {r.global_load_efficiency:.1%}"
+        f"  |  store eff {r.global_store_efficiency:.1%}",
+        f"  Warp:      efficiency {r.warp_efficiency:.1%}"
+        f"  |  divergence {r.branch_divergence_pct:.1f}%"
+        f"  |  occupancy {r.achieved_occupancy:.1%} (theoretical {r.theoretical_occupancy:.1%})"
+        f"  |  replay overhead {r.instruction_replay_overhead:.1%}",
+        f"  Instr:     tensor-core {r.tensor_core_utilization:.1%}"
+        f"  |  FP16 {r.fp16_ops:,}  FP32 {r.fp32_ops:,}"
+        f"  |  INT {r.int_ops:,}  special {r.special_func_ops:,}",
+        f"  Latency:   {r.latency_ms:.3f} ms",
+    ]
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

@@ -8,8 +8,10 @@ from teco.tools.compiler import (
     _extract_kernel_section,
     _extract_test_section,
     _namespace_functions,
+    _strip_module_level_statements,
     compile_check,
     extract_source_hash,
+    validate_correctness,
 )
 from teco.tools.code_editor import (
     apply_replacement,
@@ -79,6 +81,35 @@ class TestSourceExtraction:
         assert "def cand_test_bar" in result
         assert "def test_foo" not in result
 
+    def test_strip_keeps_defs_and_imports(self) -> None:
+        source = (
+            "import torch\n"
+            "from pathlib import Path\n"
+            "\n"
+            "def test_foo():\n"
+            "    return {'x': 1}\n"
+            "\n"
+            "result_gold = test_foo()\n"
+            "print(result_gold)\n"
+        )
+        stripped = _strip_module_level_statements(source)
+        assert "import torch" in stripped
+        assert "from pathlib" in stripped
+        assert "def test_foo" in stripped
+        assert "result_gold" not in stripped
+        assert "print(result_gold)" not in stripped
+
+    def test_strip_leaves_source_unchanged_if_no_side_effects(self) -> None:
+        # Blank lines are not AST nodes and may be dropped; only substance must be preserved.
+        source = "import torch\n\ndef test_foo():\n    pass\n"
+        stripped = _strip_module_level_statements(source)
+        assert "import torch" in stripped
+        assert "def test_foo" in stripped
+
+    def test_strip_invalid_syntax_passthrough(self) -> None:
+        bad = "def foo(\n"
+        assert _strip_module_level_statements(bad) == bad
+
 
 class TestCompileCheck:
     def test_valid_source(self) -> None:
@@ -127,3 +158,78 @@ class TestCodeEditor:
         result = apply_unified_diff(original, diff)
         assert result.success
         assert "x = 2" in result.patched_source
+
+
+# ---------------------------------------------------------------------------
+# validate_correctness (CPU-only, no Triton)
+# ---------------------------------------------------------------------------
+
+# A minimal TritonBench-style kernel file: tensor output
+_SEP = "#" * 146
+
+_KERNEL_TENSOR = f"""\
+import torch
+
+def compute(x):
+    return x * 2
+
+{_SEP}
+
+import torch
+
+def test_compute():
+    results = {{"test_case_1": compute(torch.ones(4))}}
+    return results
+
+result_gold = test_compute()
+"""
+
+# TritonBench-style: dict values are tuples of numpy arrays (like lightning_attention)
+_KERNEL_TUPLE_NUMPY = f"""\
+import torch
+import numpy as np
+
+def compute(x):
+    return x * 2
+
+{_SEP}
+
+import torch
+import numpy as np
+
+def test_compute():
+    out = compute(torch.ones(4))
+    return {{"test_case_1": (out.numpy(), out.numpy())}}
+
+result_gold = test_compute()
+print(result_gold)
+"""
+
+
+class TestValidateCorrectness:
+    def test_identical_sources_pass(self) -> None:
+        result = validate_correctness(_KERNEL_TENSOR, _KERNEL_TENSOR)
+        assert result.success, result.error_message
+
+    def test_wrong_output_fails(self) -> None:
+        wrong = _KERNEL_TENSOR.replace("x * 2", "x * 3")
+        result = validate_correctness(_KERNEL_TENSOR, wrong)
+        assert not result.success
+        assert "MISMATCH" in result.error_message
+
+    def test_tuple_numpy_outputs_pass(self) -> None:
+        result = validate_correctness(_KERNEL_TUPLE_NUMPY, _KERNEL_TUPLE_NUMPY)
+        assert result.success, result.error_message
+
+    def test_module_level_side_effects_ignored(self) -> None:
+        # result_gold = ... and print(...) at module level must not cause failures
+        result = validate_correctness(_KERNEL_TUPLE_NUMPY, _KERNEL_TUPLE_NUMPY)
+        assert result.success, result.error_message
+
+    def test_name_collision_isolation(self) -> None:
+        # Candidate redefines 'compute' with a different result — should FAIL comparison,
+        # not crash, proving namespaces are isolated.
+        cand = _KERNEL_TENSOR.replace("x * 2", "x * 99")
+        result = validate_correctness(_KERNEL_TENSOR, cand)
+        assert not result.success
+        assert "MISMATCH" in result.error_message

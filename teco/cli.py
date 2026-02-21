@@ -32,9 +32,25 @@ def optimize(
             help="Stop when this %% of hardware ceiling is reached",
         ),
     ] = 90.0,
-    verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
+    verbose: Annotated[
+        bool, typer.Option("--verbose", "-v", help="Shorthand for --verbosity 2")
+    ] = False,
+    verbosity: Annotated[
+        int, typer.Option("--verbosity", help="Output verbosity: 0=quiet 1=normal 2=verbose 3=debug")
+    ] = -1,  # -1 means "not set by user"; resolved below
 ) -> None:
     """Optimize a GPU kernel file using agentic search and profiling."""
+    from teco.config import output_config
+
+    # Resolve effective verbosity: --verbose is shorthand for --verbosity 2.
+    # Explicit --verbosity always wins; --verbose bumps to 2; default comes from config.
+    if verbosity >= 0:
+        effective_verbosity = verbosity
+    elif verbose:
+        effective_verbosity = 2
+    else:
+        effective_verbosity = output_config.verbosity
+
     if not kernel.exists():
         typer.echo(f"Error: kernel file not found: {kernel}", err=True)
         raise typer.Exit(1)
@@ -42,6 +58,7 @@ def optimize(
     typer.echo(f"TECO: optimizing {kernel} ({language}) with model {model}")
     typer.echo(f"  Knowledge root: {knowledge_root}")
     typer.echo(f"  Max iterations: {iterations}, target efficiency: {target_efficiency:.0f}%")
+    typer.echo(f"  Verbosity: {effective_verbosity}")
 
     from teco.orchestration.loop import run_optimization
 
@@ -52,7 +69,7 @@ def optimize(
         knowledge_root=knowledge_root,
         max_iterations=iterations,
         target_efficiency_pct=target_efficiency,
-        verbose=verbose,
+        verbosity=effective_verbosity,
     )
 
     # Summary

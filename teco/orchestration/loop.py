@@ -27,7 +27,7 @@ def run_optimization(
     max_iterations: int = 10,
     target_efficiency_pct: float = 90.0,
     shape_sweep: list[ShapePoint] | None = None,
-    verbose: bool = False,
+    verbosity: int = 1,
 ) -> OptimizationContext:
     """
     Top-level entry point for a full optimization run.
@@ -40,7 +40,7 @@ def run_optimization(
         max_iterations: Max optimization iterations.
         target_efficiency_pct: Stop when this % of hardware ceiling is reached.
         shape_sweep: Override the default small/medium/large shape sweep.
-        verbose: Print verbose progress.
+        verbosity: Output verbosity level (0=quiet, 1=normal, 2=verbose, 3=debug).
 
     Returns:
         The final OptimizationContext containing all results.
@@ -51,10 +51,9 @@ def run_optimization(
 
     # Hardware
     ceilings = HardwareCeilings()
-    if verbose:
+    if verbosity >= 1:
         print(f"[Loop] Hardware: {ceilings.device_name}")
-        print(f"  Peak FP16 TFLOPS: {ceilings.peak_tflops_fp16:.0f}")
-        print(f"  Peak BW: {ceilings.peak_bandwidth_gbs:.0f} GB/s")
+        print(f"  Peak FP16 TFLOPS: {ceilings.peak_tflops_fp16:.0f} | Peak BW: {ceilings.peak_bandwidth_gbs:.0f} GB/s")
 
     # Default shape sweep
     if shape_sweep is None:
@@ -75,7 +74,7 @@ def run_optimization(
         target_efficiency_pct=target_efficiency_pct,
         run_id=run_id,
         ncu_output_dir=knowledge_root / "runs" / "ncu",
-        verbose=verbose,
+        verbosity=verbosity,
     )
 
     # ── Agent pipeline ─────────────────────────────────────────────────────
@@ -98,7 +97,7 @@ def run_optimization(
     context = reflector.run(context)
 
     elapsed = time.perf_counter() - start
-    if verbose:
+    if verbosity >= 1:
         print(f"\n[Loop] Total wall time: {elapsed:.1f}s")
 
     return context
