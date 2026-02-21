@@ -1,0 +1,3 @@
+[submodule "/home/cavigelli/repos/TECO/TritonBench"]
+	path = /home/cavigelli/repos/TECO/TritonBench
+	url = https://github.com/thunlp/TritonBench
