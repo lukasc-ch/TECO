@@ -18,7 +18,7 @@ app = typer.Typer(
 def optimize(
     kernel: Annotated[Path, typer.Argument(help="Path to the kernel file to optimize")],
     language: Annotated[str, typer.Option("--language", "-l", help="Source language")] = "triton",
-    model: Annotated[str, typer.Option("--model", "-m", help="Anthropic model ID")] = "claude-opus-4-6",
+    model: Annotated[str, typer.Option("--model", "-m", help="LLM model ID (any OpenAI-compatible provider)")] = "",
     knowledge_root: Annotated[
         Path, typer.Option("--knowledge-root", help="Knowledge store root directory")
     ] = Path("knowledge"),

@@ -56,7 +56,7 @@ uv run mypy teco/
 
 ## Key design decisions
 
-- **Agent framework**: `smolagents` (Hugging Face) + Anthropic Claude API
+- **Agent framework**: `smolagents` (Hugging Face) + OpenAI-compatible API (works with any provider via `base_url`)
 - **Knowledge store**: hierarchical Markdown + JSON files (no database)
   - `patterns/`: machine-maintained YAML front-matter + human-editable Markdown body
   - Query via 3-pass funnel: hard filter → composite score → rank

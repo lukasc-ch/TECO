@@ -208,12 +208,12 @@ class HTMLReportGenerator:
             correct_cls = "ok" if correct_ok else "fail"
 
             shape_rows = ""
-            for label, tflops in it.get("shape_results", {}).items():
+            for label, latency in it.get("shape_results", {}).items():
                 pct = it.get("vs_baseline", {}).get(label, 0.0)
                 pct_cls = "positive" if pct > 0 else ("negative" if pct < 0 else "")
                 shape_rows += (
                     f"<tr><td>{html.escape(label)}</td>"
-                    f"<td class='num'>{tflops:.1f}</td>"
+                    f"<td class='num'>{latency:.6f}</td>"
                     f"<td class='num {pct_cls}'>{pct:+.1f}%</td></tr>\n"
                 )
 
@@ -225,7 +225,7 @@ class HTMLReportGenerator:
   <span class="dim">({wall:.1f}s)</span>
 </summary>
 <table class="inner">
-<thead><tr><th>Shape</th><th>TFLOPS</th><th>vs Baseline</th></tr></thead>
+<thead><tr><th>Shape</th><th>Latency (ms)</th><th>vs Baseline</th></tr></thead>
 <tbody>{shape_rows}</tbody>
 </table>
 </details>
@@ -243,7 +243,7 @@ class HTMLReportGenerator:
         peak_bw = data.get("peak_bandwidth_gbs", 0)
 
         # ── Performance over iterations ───────────────────────────────────
-        # Group by shape label: {label: [{iter, tflops}]}
+        # Group by shape label: {label: [{iter, latency_ms}]}
         shape_labels: list[str] = []
         if baseline:
             shape_labels = [b["shape"] for b in baseline]
@@ -258,11 +258,11 @@ class HTMLReportGenerator:
                     ys.append(it.get("shape_results", {}).get(label, 0))
             iter_traces.append({"x": xs, "y": ys, "name": label, "mode": "lines+markers", "type": "scatter"})
 
-        # Add baseline as horizontal lines
+        # Add baseline as horizontal lines (latency)
         for b in baseline:
             iter_traces.append({
                 "x": [1, max(it["iteration"] + 1 for it in iterations)] if iterations else [1],
-                "y": [b["tflops"], b["tflops"]],
+                "y": [b["latency_ms"], b["latency_ms"]],
                 "name": f"{b['shape']} baseline",
                 "mode": "lines",
                 "line": {"dash": "dash", "width": 1},
@@ -271,7 +271,7 @@ class HTMLReportGenerator:
 
         iter_layout = {
             "xaxis": {"title": "Iteration"},
-            "yaxis": {"title": "TFLOPS"},
+            "yaxis": {"title": "Latency (ms)"},
             "margin": {"t": 30, "b": 50, "l": 60, "r": 20},
             "legend": {"orientation": "h", "y": -0.2},
         }
@@ -292,10 +292,10 @@ class HTMLReportGenerator:
                 ys.append(it.get("shape_results", {}).get(label, 0))
             comp_traces.append({"x": xs, "y": ys, "name": label, "type": "bar"})
 
-        # Add baseline bars
+        # Add baseline bars (latency)
         for b in baseline:
             xs = list(last_by_strategy.keys())
-            ys = [b["tflops"]] * len(xs)
+            ys = [b["latency_ms"]] * len(xs)
             comp_traces.append({
                 "x": [f"{sid} {last_by_strategy[sid].get('strategy_name', '')[:16]}" for sid in xs],
                 "y": ys,
@@ -307,7 +307,7 @@ class HTMLReportGenerator:
         comp_layout = {
             "barmode": "group",
             "xaxis": {"title": "Strategy"},
-            "yaxis": {"title": "TFLOPS"},
+            "yaxis": {"title": "Latency (ms)"},
             "margin": {"t": 30, "b": 80, "l": 60, "r": 20},
             "legend": {"orientation": "h", "y": -0.3},
         }

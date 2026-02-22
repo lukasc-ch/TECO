@@ -55,8 +55,8 @@ class IterationResult:
     iteration: int
     strategy_id: str
     strategy_name: str
-    shape_results: dict[str, float]  # {shape_label: tflops}
-    vs_baseline: dict[str, float]  # {shape_label: pct change}
+    shape_results: dict[str, float]  # {shape_label: latency_ms}
+    vs_baseline: dict[str, float]  # {shape_label: pct improvement (positive = faster)}
     compile_ok: bool
     correctness_ok: bool
     wall_time_s: float

@@ -70,15 +70,24 @@ class OptimizationContext:
         if self.verbosity >= level:
             print(msg)
 
-    def best_tflops_across_shapes(self) -> float:
-        """Return the best TFLOPS achieved in Stage 1 across all shapes and strategies."""
-        best = 0.0
+    def best_latency_across_shapes(self) -> float:
+        """Return the best (lowest) latency_ms achieved across all shapes and strategies.
+
+        Returns float('inf') if no results exist.
+        """
+        best = float("inf")
         for strategy in self.strategy_tree.strategies:
             for result in strategy.shape_results:
-                best = max(best, result.achieved_tflops)
+                if result.latency_ms > 0:
+                    best = min(best, result.latency_ms)
         return best
 
+    def baseline_latency(self, shape_label: str = "medium") -> float:
+        """Return baseline latency_ms for a given shape label."""
+        return self.baseline_stage1.get(shape_label, {}).get("latency_ms", 0.0)
+
     def baseline_tflops(self, shape_label: str = "medium") -> float:
+        """Return baseline TFLOPS for a given shape label (for roofline reporting only)."""
         return self.baseline_stage1.get(shape_label, {}).get("tflops", 0.0)
 
     def primary_bottleneck(self) -> str:
@@ -88,6 +97,14 @@ class OptimizationContext:
             return report.bottleneck
         return "unknown"
 
+    def latency_speedup(self, new_latency: float, shape_label: str = "medium") -> float:
+        """Compute speedup as baseline_latency / new_latency (higher is better)."""
+        baseline = self.baseline_latency(shape_label)
+        if baseline <= 0 or new_latency <= 0:
+            return 1.0
+        return baseline / new_latency
+
     def efficiency_pct(self, tflops: float, dtype: str = "fp16") -> float:
+        """Compute efficiency as % of hardware peak TFLOPS (for roofline reporting only)."""
         peak = self.ceilings.peak_tflops(dtype)
         return (tflops / peak * 100) if peak > 0 else 0.0

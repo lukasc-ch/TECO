@@ -1,16 +1,16 @@
 """TECO configuration.
 
 Settings are loaded in this priority order (highest wins):
-  1. Environment variables  (TECO_* or ANTHROPIC_API_KEY)
+  1. Environment variables  (TECO_* or OPENAI_API_KEY)
   2. teco.toml in the current working directory
   3. ~/.config/teco/teco.toml
   4. Built-in defaults
 
 Example teco.toml:
   [llm]
-  model    = "claude-opus-4-6"
-  api_key  = "sk-ant-..."   # or set ANTHROPIC_API_KEY
-  base_url = "https://api.anthropic.com"  # override for proxies
+  model    = "gpt-4o"
+  api_key  = "sk-..."        # or set OPENAI_API_KEY
+  base_url = ""              # override for non-OpenAI providers (vLLM, Ollama, etc.)
 
   [output]
   verbosity = 1  # 0=quiet  1=normal  2=verbose  3=debug
@@ -39,7 +39,7 @@ def _load_toml_full() -> dict:
 
 
 _LLM_DEFAULTS: dict[str, str] = {
-    "model":    "claude-opus-4-6",
+    "model":    "",
     "api_key":  "",
     "base_url": "",
 }
@@ -58,7 +58,7 @@ class LLMConfig:
         )
         self.api_key: str = (
             os.environ.get("TECO_API_KEY")
-            or os.environ.get("ANTHROPIC_API_KEY")
+            or os.environ.get("OPENAI_API_KEY")
             or llm.get("api_key")
             or _LLM_DEFAULTS["api_key"]
         )
@@ -68,15 +68,15 @@ class LLMConfig:
             or _LLM_DEFAULTS["base_url"]
         )
 
-    def anthropic_client(self) -> "anthropic.Anthropic":  # type: ignore[name-defined]
-        import anthropic
+    def openai_client(self) -> "openai.OpenAI":  # type: ignore[name-defined]
+        import openai
 
         kwargs: dict[str, str] = {}
         if self.api_key:
             kwargs["api_key"] = self.api_key
         if self.base_url:
             kwargs["base_url"] = self.base_url
-        return anthropic.Anthropic(**kwargs)
+        return openai.OpenAI(**kwargs)
 
 
 class OutputConfig:

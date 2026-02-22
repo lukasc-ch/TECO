@@ -321,13 +321,13 @@ class OptimizerAgent(BaseAgent):
             leader.current_code = new_source
             leader.iterations_applied += 1
 
-            # Report per-shape progress
-            best_tflops = max((r.achieved_tflops for r in shape_results), default=0.0)
-            context.log(f"  Best TFLOPS this iteration: {best_tflops:.1f}")
+            # Report per-shape progress (latency is the primary metric)
+            best_latency = min((r.latency_ms for r in shape_results if r.latency_ms > 0), default=0.0)
+            context.log(f"  Best latency this iteration: {best_latency:.6f} ms")
             context.log(_fmt_shape_results(shape_results), level=2)
 
-            # Emit iteration result to tracker
-            shape_dict = {r.shape_point.label: r.achieved_tflops for r in shape_results}
+            # Emit iteration result to tracker (latency_ms per shape)
+            shape_dict = {r.shape_point.label: r.latency_ms for r in shape_results}
             vs_dict = {r.shape_point.label: r.vs_baseline_pct for r in shape_results}
             tracker.record_iteration(
                 iteration=iteration,
@@ -340,20 +340,18 @@ class OptimizerAgent(BaseAgent):
                 wall_time_s=_time.perf_counter() - iter_start,
             )
 
-            # 6. Check efficiency ceiling
-            eff = context.efficiency_pct(best_tflops)
-            if eff >= context.target_efficiency_pct:
-                context.log(f"  Reached {eff:.1f}% of hardware ceiling. Stopping.")
-                break
-
-            # 7. Plateau detection
-            prev_best = context.best_tflops_across_shapes()
-            if best_tflops <= prev_best * (1 + context.plateau_threshold):
-                consecutive_plateau += 1
-            else:
-                consecutive_plateau = 0
+            # 6. Plateau detection (based on latency improvement)
+            # For latency, improvement means lower values, so we check if the
+            # best latency is not significantly better than the previous best.
+            prev_best = context.best_latency_across_shapes()
+            if best_latency > 0 and prev_best < float("inf"):
+                improvement_pct = (prev_best - best_latency) / prev_best
+                if improvement_pct < context.plateau_threshold:
+                    consecutive_plateau += 1
+                else:
+                    consecutive_plateau = 0
             if consecutive_plateau >= 2:
-                context.log("  Plateau detected (2 consecutive iterations < 2% improvement). Stopping.")
+                context.log("  Plateau detected (2 consecutive iterations < 2% latency improvement). Stopping.")
                 break
 
         return context
@@ -497,7 +495,7 @@ class OptimizerAgent(BaseAgent):
                     "id": s.id,
                     "name": s.name,
                     "regime": s.winning_shape_range.description if s.winning_shape_range else "all",
-                    "tflops": f"{max((r.achieved_tflops for r in s.shape_results), default=0.0):.1f}",
+                    "latency_ms": f"{min((r.latency_ms for r in s.shape_results if r.latency_ms > 0), default=0.0):.6f}",
                 }
                 for s in regime_winners
             ],
@@ -605,7 +603,7 @@ class OptimizerAgent(BaseAgent):
         shape_perf = ""
         if strategy.shape_results:
             rows = "\n".join(
-                f"  {r.shape_point.label}: {r.achieved_tflops:.1f} TFLOPS "
+                f"  {r.shape_point.label}: {r.latency_ms:.6f} ms "
                 f"({r.vs_baseline_pct:+.1f}% vs baseline)"
                 for r in strategy.shape_results
             )
@@ -782,20 +780,27 @@ class OptimizerAgent(BaseAgent):
     def _profile_strategy_stage1(
         self, source: str, context: OptimizationContext
     ) -> list[StrategyShapeResult]:
-        """Profile a candidate kernel across the shape sweep using Stage 1."""
+        """Profile a candidate kernel across the shape sweep using Stage 1.
+
+        The primary metric is latency_ms.  vs_baseline_pct is computed as the
+        percentage *reduction* in latency (positive = faster).
+        """
         results: list[StrategyShapeResult] = []
         for shape in context.shape_sweep:
             metrics = self._profile_stage1_subprocess(source, shape, context)
+            latency = metrics.get("latency_ms", 0.0)
             tflops = metrics.get("tflops", 0.0)
-            baseline_tflops = context.baseline_stage1.get(shape.label, {}).get("tflops", 0.0)
+            baseline_lat = context.baseline_stage1.get(shape.label, {}).get("latency_ms", 0.0)
+            # Positive vs_baseline_pct means the optimized kernel is faster
             vs_baseline = (
-                ((tflops - baseline_tflops) / baseline_tflops * 100)
-                if baseline_tflops > 0
+                ((baseline_lat - latency) / baseline_lat * 100)
+                if baseline_lat > 0
                 else 0.0
             )
             results.append(
                 StrategyShapeResult(
                     shape_point=shape,
+                    latency_ms=latency,
                     achieved_tflops=tflops,
                     vs_baseline_pct=vs_baseline,
                 )
@@ -805,13 +810,24 @@ class OptimizerAgent(BaseAgent):
     def _profile_stage1_subprocess(
         self, source: str, shape: ShapePoint, context: OptimizationContext
     ) -> dict[str, float]:
-        """Run Stage 1 profiling by executing a generated runner script in a subprocess."""
+        """Run Stage 1 profiling by executing a generated runner script in a subprocess.
+
+        The kernel source is written to a separate temp file and exec'd by the
+        runner script.  This avoids indentation and inline-embedding issues.
+        """
         import subprocess
         import sys
         import tempfile
 
-        runner = self._generate_runner_script(source, shape, context, stage=1)
-        with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
+        # Write kernel source to its own temp file
+        with tempfile.NamedTemporaryFile(
+            suffix="_kernel.py", mode="w", delete=False
+        ) as kf:
+            kf.write(source)
+            kernel_path = Path(kf.name)
+
+        runner = self._generate_runner_script(str(kernel_path), shape, context, stage=1)
+        with tempfile.NamedTemporaryFile(suffix="_runner.py", mode="w", delete=False) as f:
             f.write(runner)
             runner_path = Path(f.name)
 
@@ -823,11 +839,32 @@ class OptimizerAgent(BaseAgent):
                 timeout=120,
             )
             if result.returncode == 0:
-                return json.loads(result.stdout.strip())
-        except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception):
-            pass
+                stdout = result.stdout.strip()
+                # Find the last JSON line (kernel source may print other output)
+                for line in reversed(stdout.splitlines()):
+                    line = line.strip()
+                    if line.startswith("{"):
+                        try:
+                            return json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                context.log(
+                    f"  [profiler] Warning: no JSON in stdout for {shape.label}",
+                    level=2,
+                )
+            else:
+                stderr_preview = (result.stderr or "")[:300]
+                context.log(
+                    f"  [profiler] Runner failed (rc={result.returncode}) for {shape.label}: {stderr_preview}",
+                    level=2,
+                )
+        except subprocess.TimeoutExpired:
+            context.log(f"  [profiler] Runner timed out for {shape.label}", level=2)
+        except Exception as e:
+            context.log(f"  [profiler] Runner error for {shape.label}: {e}", level=2)
         finally:
             runner_path.unlink(missing_ok=True)
+            kernel_path.unlink(missing_ok=True)
         return {"tflops": 0.0, "latency_ms": 0.0}
 
     def _profile_stage2(
@@ -838,69 +875,94 @@ class OptimizerAgent(BaseAgent):
         label: str,
     ):
         """Run Stage 2 ncu profiling for a single (kernel, shape) pair."""
-        runner = self._generate_runner_script(source, shape, context, stage=2)
-        return profile_deep_ncu(
-            runner_script=runner,
-            output_dir=self.ncu_output_dir,
-            label=label,
-            ceilings=context.ceilings,
-        )
+        import tempfile
+
+        # Write kernel source to its own temp file
+        with tempfile.NamedTemporaryFile(
+            suffix="_kernel.py", mode="w", delete=False
+        ) as kf:
+            kf.write(source)
+            kernel_path = Path(kf.name)
+
+        runner = self._generate_runner_script(str(kernel_path), shape, context, stage=2)
+        try:
+            return profile_deep_ncu(
+                runner_script=runner,
+                output_dir=self.ncu_output_dir,
+                label=label,
+                ceilings=context.ceilings,
+            )
+        finally:
+            kernel_path.unlink(missing_ok=True)
 
     def _generate_runner_script(
-        self, source: str, shape: ShapePoint, context: OptimizationContext, stage: int
+        self, kernel_path: str, shape: ShapePoint, context: OptimizationContext, stage: int
     ) -> str:
         """Generate a standalone Python script that executes the kernel at a given shape.
 
-        For Stage 1: prints JSON with {tflops, latency_ms, bandwidth_gbs}.
+        Args:
+            kernel_path: Path to a temp file containing the kernel source.
+            shape: The shape point to profile at.
+            context: Optimization context.
+            stage: 1 for latency benchmarking, 2 for ncu single execution.
+
+        For Stage 1: prints JSON with {tflops, latency_ms}.
         For Stage 2: just runs the kernel once (ncu wraps the process).
 
-        The LLM is asked to generate the benchmark harness specific to the kernel.
+        The kernel source is loaded via exec() from a separate file to avoid
+        indentation and embedding issues.
         """
-        # In practice the agent generates the runner; this is the fallback for
-        # kernels that follow the TritonBench test function convention.
-        dims_str = ", ".join(f"{k}={v}" for k, v in shape.dims.items())
+        # Escape the kernel path for embedding in a Python string
+        escaped_path = kernel_path.replace("\\", "\\\\").replace("'", "\\'")
+
+        # We use importlib to load the kernel as a proper module so that
+        # @triton.jit can use inspect.getsource() on the decorated functions.
+        load_kernel = (
+            "import importlib.util, sys, os\n"
+            "sys.path.insert(0, '.')\n"
+            f"_spec = importlib.util.spec_from_file_location('_kernel', '{escaped_path}')\n"
+            "_mod = importlib.util.module_from_spec(_spec)\n"
+            "sys.modules['_kernel'] = _mod\n"
+            "_spec.loader.exec_module(_mod)\n"
+            "# Copy all names into globals so test_fns discovery works\n"
+            "for _k, _v in vars(_mod).items():\n"
+            "    if not _k.startswith('__'):\n"
+            "        globals()[_k] = _v\n"
+        )
+
         if stage == 1:
-            return textwrap.dedent(f"""\
-                import json, sys, torch
-                sys.path.insert(0, '.')
-
-                # --- Kernel source ---
-                {source}
-
-                # --- Benchmark harness ---
-                try:
-                    from triton.testing import do_bench
-                    # Attempt to call the first test_ function and time it
-                    import inspect
-                    test_fns = [(k, v) for k, v in list(globals().items())
-                                if k.startswith('test_') and callable(v)]
-                    if test_fns:
-                        fn_name, fn = test_fns[0]
-                        latency_ms = do_bench(fn, warmup=10, rep=50)
-                        print(json.dumps({{"tflops": 0.0, "latency_ms": latency_ms}}))
-                    else:
-                        print(json.dumps({{"tflops": 0.0, "latency_ms": 0.0}}))
-                except Exception as e:
-                    print(json.dumps({{"error": str(e), "tflops": 0.0, "latency_ms": 0.0}}))
-            """)
+            return (
+                "import json\n"
+                + load_kernel
+                + "\n"
+                "# --- Benchmark harness ---\n"
+                "try:\n"
+                "    from triton.testing import do_bench\n"
+                "    test_fns = [(k, v) for k, v in list(globals().items())\n"
+                "                if k.startswith('test_') and callable(v)]\n"
+                "    if test_fns:\n"
+                "        fn_name, fn = test_fns[0]\n"
+                "        latency_ms = do_bench(fn, warmup=10, rep=50)\n"
+                "        print(json.dumps({'tflops': 0.0, 'latency_ms': float(latency_ms)}))\n"
+                "    else:\n"
+                "        print(json.dumps({'tflops': 0.0, 'latency_ms': 0.0, 'error': 'no test_ functions found'}))\n"
+                "except Exception as e:\n"
+                "    print(json.dumps({'error': str(e), 'tflops': 0.0, 'latency_ms': 0.0}))\n"
+            )
         else:  # stage 2: just run
-            return textwrap.dedent(f"""\
-                import sys, torch
-                sys.path.insert(0, '.')
-
-                # --- Kernel source ---
-                {source}
-
-                # --- Single execution for ncu ---
-                try:
-                    import inspect
-                    test_fns = [(k, v) for k, v in list(globals().items())
-                                if k.startswith('test_') and callable(v)]
-                    if test_fns:
-                        test_fns[0][1]()
-                except Exception as e:
-                    print(f"ERROR: {{e}}", file=sys.stderr)
-            """)
+            return (
+                load_kernel
+                + "\n"
+                "# --- Single execution for ncu ---\n"
+                "try:\n"
+                "    test_fns = [(k, v) for k, v in list(globals().items())\n"
+                "                if k.startswith('test_') and callable(v)]\n"
+                "    if test_fns:\n"
+                "        test_fns[0][1]()\n"
+                "except Exception as e:\n"
+                "    import sys\n"
+                "    print(f'ERROR: {e}', file=sys.stderr)\n"
+            )
 
     def _generate_dispatch_wrapper(
         self, winners: list[Strategy], context: OptimizationContext
@@ -960,52 +1022,57 @@ class OptimizerAgent(BaseAgent):
     def _best_shape_for_strategy(
         self, strategy: Strategy, context: OptimizationContext
     ) -> ShapePoint:
+        """Pick the shape where this strategy has the best latency improvement."""
         if strategy.shape_results:
-            best = max(strategy.shape_results, key=lambda r: r.achieved_tflops)
+            # Best = highest vs_baseline_pct (most latency reduction)
+            best = max(strategy.shape_results, key=lambda r: r.vs_baseline_pct)
             return best.shape_point
         return context.shape_sweep[len(context.shape_sweep) // 2] if context.shape_sweep else ShapePoint(label="medium", dims={})
 
     def _compute_overall_speedup(self, context: OptimizationContext) -> float:
-        baseline = context.baseline_stage1.get("medium", {}).get("tflops", 0.0)
-        if baseline <= 0:
+        """Compute overall speedup as baseline_latency / best_latency at medium shape."""
+        baseline_lat = context.baseline_latency("medium")
+        if baseline_lat <= 0:
             return 1.0
-        best = context.best_tflops_across_shapes()
-        return best / baseline if baseline > 0 else 1.0
+        best_lat = context.best_latency_across_shapes()
+        if best_lat <= 0 or best_lat == float("inf"):
+            return 1.0
+        return baseline_lat / best_lat
 
     def _compute_regime_speedups(self, context: OptimizationContext) -> dict[str, float]:
+        """Compute per-shape speedup as baseline_latency / best_strategy_latency."""
         speedups: dict[str, float] = {}
         for shape in context.shape_sweep:
-            baseline = context.baseline_stage1.get(shape.label, {}).get("tflops", 0.0)
-            if baseline <= 0:
+            baseline_lat = context.baseline_stage1.get(shape.label, {}).get("latency_ms", 0.0)
+            if baseline_lat <= 0:
                 continue
-            best = max(
-                (
-                    next(
-                        (r.achieved_tflops for r in s.shape_results if r.shape_point.label == shape.label),
-                        0.0,
-                    )
-                    for s in context.strategy_tree.strategies
-                    if s.status == "regime_winner"
-                ),
-                default=baseline,
-            )
-            speedups[shape.label] = best / baseline
+            # Find the best (lowest) latency among regime winners for this shape
+            best_lat = baseline_lat
+            for s in context.strategy_tree.strategies:
+                if s.status == "regime_winner":
+                    for r in s.shape_results:
+                        if r.shape_point.label == shape.label and r.latency_ms > 0:
+                            best_lat = min(best_lat, r.latency_ms)
+            speedups[shape.label] = baseline_lat / best_lat if best_lat > 0 else 1.0
         return speedups
 
     def _strategy_speedup(self, strategy: Strategy, context: OptimizationContext) -> float | None:
+        """Compute speedup for a strategy as baseline_latency / strategy_latency."""
         if not strategy.shape_results:
             return None
-        best_result = max(strategy.shape_results, key=lambda r: r.achieved_tflops)
-        baseline = context.baseline_stage1.get(best_result.shape_point.label, {}).get("tflops", 0.0)
-        if baseline <= 0:
+        # Pick the shape with the best improvement
+        best_result = max(strategy.shape_results, key=lambda r: r.vs_baseline_pct)
+        baseline_lat = context.baseline_stage1.get(best_result.shape_point.label, {}).get("latency_ms", 0.0)
+        if baseline_lat <= 0 or best_result.latency_ms <= 0:
             return None
-        return best_result.achieved_tflops / baseline
+        return baseline_lat / best_result.latency_ms
 
     def _strategy_records(self, tree: StrategyTree) -> list[StrategyRecord]:
         records: list[StrategyRecord] = []
         for s in tree.strategies:
             shape_results = {
                 r.shape_point.label: {
+                    "latency_ms": r.latency_ms,
                     "achieved_tflops": r.achieved_tflops,
                     "vs_baseline_pct": r.vs_baseline_pct,
                 }
@@ -1056,7 +1123,7 @@ class OptimizerAgent(BaseAgent):
             perf = ""
             if s.shape_results:
                 perf = " | ".join(
-                    f"{r.shape_point.label}: {r.achieved_tflops:.1f} TFLOPS ({r.vs_baseline_pct:+.1f}%)"
+                    f"{r.shape_point.label}: {r.latency_ms:.6f} ms ({r.vs_baseline_pct:+.1f}%)"
                     for r in s.shape_results
                 )
             lines.append(
@@ -1147,11 +1214,11 @@ def _fmt_strategy_table(strategies: "list[Strategy]") -> str:  # type: ignore[na
 
 def _fmt_shape_results(results: "list[StrategyShapeResult]") -> str:  # type: ignore[name-defined]
     """Format per-shape profiling results as a compact table (level 2)."""
-    lines = [f"  {'Shape':<10}  {'TFLOPS':>8}  {'vs baseline':>12}"]
-    lines.append("  " + "─" * 34)
+    lines = [f"  {'Shape':<10}  {'Latency (ms)':>15}  {'vs baseline':>12}"]
+    lines.append("  " + "─" * 41)
     for r in results:
         lines.append(
-            f"  {r.shape_point.label:<10}  {r.achieved_tflops:>8.1f}  {r.vs_baseline_pct:>+11.1f}%"
+            f"  {r.shape_point.label:<10}  {r.latency_ms:>15.6f}  {r.vs_baseline_pct:>+11.1f}%"
         )
     return "\n".join(lines)
 
@@ -1176,7 +1243,7 @@ def _fmt_report(report: "ProfilingReport") -> str:  # type: ignore[name-defined]
         f"  Instr:     tensor-core {r.tensor_core_utilization:.1%}"
         f"  |  FP16 {r.fp16_ops:,}  FP32 {r.fp32_ops:,}"
         f"  |  INT {r.int_ops:,}  special {r.special_func_ops:,}",
-        f"  Latency:   {r.latency_ms:.3f} ms",
+        f"  Latency:   {r.latency_ms:.6f} ms",
     ]
     return "\n".join(lines)
 

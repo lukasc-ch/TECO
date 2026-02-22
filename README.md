@@ -58,6 +58,8 @@ uv run teco query a100-sxm4-80gb --tags attention,softmax                       
 
  uv run teco optimize TritonBench/data/TritonBench_G_v1/max_reduction.py --verbosity 3 # output all info
 
+uv run teco optimize TritonBench/data/TritonBench_G_v1/chunk_cumsum_vector.py
+uv run teco optimize TritonBench/data/TritonBench_G_v1/vector_addition.py
 
 uv run pytest                                                                     # full test suite (GPU)
 ```

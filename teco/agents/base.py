@@ -16,8 +16,22 @@ _INITIAL_BACKOFF_S = 1.0
 _BACKOFF_MULTIPLIER = 2.0
 _MAX_BACKOFF_S = 60.0
 
-# Error types that are considered transient and worth retrying
-_RETRYABLE_ERRORS = {"api_error", "overloaded", "rate_limit_error", "timeout"}
+
+def _is_retryable(exc: Exception) -> bool:
+    """Return True if *exc* is a transient OpenAI API error worth retrying."""
+    try:
+        import openai
+    except ImportError:
+        return False
+    return isinstance(
+        exc,
+        (
+            openai.RateLimitError,
+            openai.APITimeoutError,
+            openai.APIConnectionError,
+            openai.InternalServerError,
+        ),
+    )
 
 
 class LLMError(RuntimeError):
@@ -41,16 +55,16 @@ class BaseAgent(ABC):
         """Execute this agent's task and return the updated context."""
 
     def _llm_call(self, system: str, user: str, **kwargs: Any) -> str:
-        """Make a direct Anthropic API call with tool use disabled.
+        """Make an OpenAI-compatible chat completion API call.
 
         Used for structured reasoning tasks (strategy planning, reflection).
-        Returns the text content of the first text block.
+        Returns the text content of the assistant's reply.
 
-        Retries transient errors (overloaded, rate-limit, timeout) with
-        exponential backoff, reporting each attempt to stderr so the user
-        can see what is happening.
+        Retries transient errors (rate-limit, timeout, connection, server)
+        with exponential backoff, reporting each attempt to stderr so the
+        user can see what is happening.
         """
-        client = self._config.anthropic_client()
+        client = self._config.openai_client()
         max_tokens = kwargs.get("max_tokens", 4096)
 
         backoff = _INITIAL_BACKOFF_S
@@ -58,57 +72,38 @@ class BaseAgent(ABC):
 
         for attempt in range(1, _MAX_RETRIES + 1):
             try:
-                response = client.messages.create(
+                response = client.chat.completions.create(
                     model=self.model_id,
                     max_tokens=max_tokens,
-                    system=system,
-                    messages=[{"role": "user", "content": user}],
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
                 )
+                # Success — extract text content
+                content = response.choices[0].message.content
+                return content if content is not None else ""
+
             except Exception as exc:
-                # Network-level or SDK-level exceptions (connection reset, timeout, etc.)
                 last_error_msg = f"{type(exc).__name__}: {exc}"
+                retryable = _is_retryable(exc)
                 print(
                     f"[LLM] Attempt {attempt}/{_MAX_RETRIES} failed — {last_error_msg}",
                     file=sys.stderr,
                 )
-                if attempt < _MAX_RETRIES:
-                    print(f"[LLM] Retrying in {backoff:.1f}s …", file=sys.stderr)
-                    time.sleep(backoff)
-                    backoff = min(backoff * _BACKOFF_MULTIPLIER, _MAX_BACKOFF_S)
-                continue
-
-            # The Anthropic SDK may parse an error response from a proxy
-            # (e.g. OpenRouter) into a Message with type='error' and content=None.
-            error_info = getattr(response, "error", None)
-            if response.content is None or getattr(response, "type", None) == "error":
-                error_type = error_info.get("type", "unknown") if isinstance(error_info, dict) else "unknown"
-                error_message = error_info.get("message", "unknown error") if isinstance(error_info, dict) else str(error_info)
-                last_error_msg = f"{error_type}: {error_message}"
-
-                is_retryable = error_type.lower() in _RETRYABLE_ERRORS or "overload" in error_message.lower()
-                print(
-                    f"[LLM] Attempt {attempt}/{_MAX_RETRIES} — API error: {last_error_msg}",
-                    file=sys.stderr,
-                )
-                if is_retryable and attempt < _MAX_RETRIES:
+                if retryable and attempt < _MAX_RETRIES:
                     print(f"[LLM] Retrying in {backoff:.1f}s …", file=sys.stderr)
                     time.sleep(backoff)
                     backoff = min(backoff * _BACKOFF_MULTIPLIER, _MAX_BACKOFF_S)
                     continue
 
-                # Non-retryable or exhausted retries
-                raise LLMError(
-                    f"LLM API returned an error after {attempt} attempt(s): {last_error_msg}\n"
-                    f"  model={self.model_id}  base_url={self._config.base_url or '(default)'}"
-                )
+                if not retryable:
+                    raise LLMError(
+                        f"LLM API returned an error after {attempt} attempt(s): {last_error_msg}\n"
+                        f"  model={self.model_id}  base_url={self._config.base_url or '(default)'}"
+                    ) from exc
 
-            # Success — extract text content
-            for block in response.content:
-                if block.type == "text":
-                    return block.text
-            return ""
-
-        # All retries exhausted (only reached if every attempt hit the except branch)
+        # All retries exhausted (only reached if every attempt hit a retryable error)
         raise LLMError(
             f"LLM API call failed after {_MAX_RETRIES} attempts: {last_error_msg}\n"
             f"  model={self.model_id}  base_url={self._config.base_url or '(default)'}"

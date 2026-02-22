@@ -152,15 +152,15 @@ class RichConsoleReporter:
         compile_icon = "✓" if result.compile_ok else "✗"
         correct_icon = "✓" if result.correctness_ok else "✗"
 
-        # Build per-shape summary
+        # Build per-shape summary (latency_ms is the primary metric)
         shape_parts: list[str] = []
-        for label, tflops in result.shape_results.items():
+        for label, latency in result.shape_results.items():
             pct = result.vs_baseline.get(label, 0.0)
             if HAS_RICH:
                 color = "green" if pct > 0 else ("red" if pct < 0 else "white")
-                shape_parts.append(f"[{color}]{label}: {tflops:.1f} ({pct:+.1f}%)[/{color}]")
+                shape_parts.append(f"[{color}]{label}: {latency:.6f}ms ({pct:+.1f}%)[/{color}]")
             else:
-                shape_parts.append(f"{label}: {tflops:.1f} ({pct:+.1f}%)")
+                shape_parts.append(f"{label}: {latency:.6f}ms ({pct:+.1f}%)")
 
         line = (
             f"  [{result.strategy_id}] {result.strategy_name} → "
@@ -182,12 +182,12 @@ class RichConsoleReporter:
         if self.verbosity >= 2 and HAS_RICH and self._console:
             table = Table(show_header=True, header_style="bold", box=None, padding=(0, 1))
             table.add_column("Shape", style="cyan", width=10)
-            table.add_column("TFLOPS", justify="right", width=10)
+            table.add_column("Latency (ms)", justify="right", width=12)
             table.add_column("vs baseline", justify="right", width=12)
-            for label, tflops in result.shape_results.items():
+            for label, latency in result.shape_results.items():
                 pct = result.vs_baseline.get(label, 0.0)
                 color = "green" if pct > 0 else ("red" if pct < 0 else "white")
-                table.add_row(label, f"{tflops:.1f}", f"[{color}]{pct:+.1f}%[/{color}]")
+                table.add_row(label, f"{latency:.6f}", f"[{color}]{pct:+.1f}%[/{color}]")
             if self._progress:
                 self._progress.stop()
             self._console.print(table)
@@ -216,7 +216,7 @@ class RichConsoleReporter:
                 for w in summary.regime_winners:
                     lines.append(
                         f"  [green]★[/green] {w.get('id', '?')} {w.get('name', '?')} "
-                        f"→ {w.get('regime', '?')} ({w.get('tflops', '?')} TFLOPS)"
+                        f"→ {w.get('regime', '?')} ({w.get('latency_ms', '?')} ms)"
                     )
             if summary.pruned_strategies:
                 lines.append("")
@@ -247,7 +247,7 @@ class RichConsoleReporter:
             if summary.regime_winners:
                 print("  Regime winners:")
                 for w in summary.regime_winners:
-                    print(f"    ★ {w.get('id')} {w.get('name')} → {w.get('regime')} ({w.get('tflops')} TFLOPS)")
+                    print(f"    ★ {w.get('id')} {w.get('name')} → {w.get('regime')} ({w.get('latency_ms')} ms)")
             if summary.pruned_strategies:
                 print("  Pruned:")
                 for p in summary.pruned_strategies:

@@ -25,7 +25,7 @@ def run_optimization(
     kernel_path: Path,
     *,
     language: str = "triton",
-    model_id: str = "claude-opus-4-6",
+    model_id: str = "",
     knowledge_root: Path = Path("knowledge"),
     max_iterations: int = 10,
     target_efficiency_pct: float = 90.0,
@@ -39,7 +39,7 @@ def run_optimization(
     Args:
         kernel_path: Path to the Triton (or other language) kernel file.
         language: Source language identifier.
-        model_id: Anthropic model to use for all agents.
+        model_id: LLM model ID (any OpenAI-compatible provider).
         knowledge_root: Root of the knowledge store directory.
         max_iterations: Max optimization iterations.
         target_efficiency_pct: Stop when this % of hardware ceiling is reached.

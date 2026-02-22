@@ -140,8 +140,9 @@ class KernelCharacteristics(BaseModel):
 
 class StrategyShapeResult(BaseModel):
     shape_point: ShapePoint
-    achieved_tflops: float
-    vs_baseline_pct: float  # percentage change vs baseline at same shape
+    latency_ms: float = 0.0  # primary metric for decision-making
+    achieved_tflops: float = 0.0  # kept for roofline reporting only
+    vs_baseline_pct: float = 0.0  # percentage improvement in latency vs baseline (positive = faster)
     profiling_report: ProfilingReport | None = None
 
 
