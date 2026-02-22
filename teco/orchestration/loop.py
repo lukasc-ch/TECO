@@ -14,6 +14,9 @@ from teco.agents.reflector import ReflectorAgent
 from teco.knowledge.schema import ShapePoint
 from teco.knowledge.store import KnowledgeStore
 from teco.orchestration.context import OptimizationContext
+from teco.reporting.console import RichConsoleReporter
+from teco.reporting.html_report import HTMLReportGenerator
+from teco.reporting.tracker import ProgressTracker
 from teco.tools.code_editor import read_kernel_file
 from teco.tools.profiler import HardwareCeilings
 
@@ -28,6 +31,7 @@ def run_optimization(
     target_efficiency_pct: float = 90.0,
     shape_sweep: list[ShapePoint] | None = None,
     verbosity: int = 1,
+    generate_report: bool = True,
 ) -> OptimizationContext:
     """
     Top-level entry point for a full optimization run.
@@ -41,6 +45,7 @@ def run_optimization(
         target_efficiency_pct: Stop when this % of hardware ceiling is reached.
         shape_sweep: Override the default small/medium/large shape sweep.
         verbosity: Output verbosity level (0=quiet, 1=normal, 2=verbose, 3=debug).
+        generate_report: Whether to produce an HTML report after the run.
 
     Returns:
         The final OptimizationContext containing all results.
@@ -51,9 +56,6 @@ def run_optimization(
 
     # Hardware
     ceilings = HardwareCeilings()
-    if verbosity >= 1:
-        print(f"[Loop] Hardware: {ceilings.device_name}")
-        print(f"  Peak FP16 TFLOPS: {ceilings.peak_tflops_fp16:.0f} | Peak BW: {ceilings.peak_bandwidth_gbs:.0f} GB/s")
 
     # Default shape sweep
     if shape_sweep is None:
@@ -61,6 +63,17 @@ def run_optimization(
 
     # Knowledge store
     store = KnowledgeStore(knowledge_root=knowledge_root)
+
+    # Progress tracker + console reporter
+    tracker = ProgressTracker(
+        run_id=run_id,
+        max_iterations=max_iterations,
+        device_name=ceilings.device_name,
+        peak_tflops_fp16=ceilings.peak_tflops_fp16,
+        peak_bandwidth_gbs=ceilings.peak_bandwidth_gbs,
+    )
+    reporter = RichConsoleReporter(tracker, verbosity=verbosity)
+    tracker.add_listener(reporter)
 
     # Build context
     context = OptimizationContext(
@@ -74,11 +87,12 @@ def run_optimization(
         target_efficiency_pct=target_efficiency_pct,
         run_id=run_id,
         ncu_output_dir=knowledge_root / "runs" / "ncu",
+        tracker=tracker,
         verbosity=verbosity,
+        generate_report=generate_report,
     )
 
     # ── Agent pipeline ─────────────────────────────────────────────────────
-    start = time.perf_counter()
 
     # Phase 1: LearnerAgent (stub — checks if new hardware/language needs doc research)
     learner = LearnerAgent(model_id=model_id)
@@ -96,9 +110,13 @@ def run_optimization(
     reflector = ReflectorAgent(model_id=model_id)
     context = reflector.run(context)
 
-    elapsed = time.perf_counter() - start
-    if verbosity >= 1:
-        print(f"\n[Loop] Total wall time: {elapsed:.1f}s")
+    # ── HTML report generation ─────────────────────────────────────────────
+    if generate_report:
+        report_gen = HTMLReportGenerator()
+        report_path = report_gen.generate(tracker, output_dir=knowledge_root / "runs")
+        # Update the final summary with the report path
+        if tracker.final_summary:
+            tracker.final_summary.report_path = str(report_path)
 
     return context
 

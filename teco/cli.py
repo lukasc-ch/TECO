@@ -38,6 +38,9 @@ def optimize(
     verbosity: Annotated[
         int, typer.Option("--verbosity", help="Output verbosity: 0=quiet 1=normal 2=verbose 3=debug")
     ] = -1,  # -1 means "not set by user"; resolved below
+    report: Annotated[
+        bool, typer.Option("--report/--no-report", help="Generate HTML report after the run")
+    ] = True,
 ) -> None:
     """Optimize a GPU kernel file using agentic search and profiling."""
     from teco.config import output_config
@@ -70,12 +73,14 @@ def optimize(
         max_iterations=iterations,
         target_efficiency_pct=target_efficiency,
         verbosity=effective_verbosity,
+        generate_report=report,
     )
 
     # Summary
-    speedup = context._compute_overall_speedup() if hasattr(context, "_compute_overall_speedup") else 1.0
     typer.echo(f"\nDone. Run ID: {context.run_id}")
     typer.echo(f"Strategies deployed: {sum(1 for s in context.strategy_tree.strategies if s.status == 'regime_winner')}")
+    if context.tracker.final_summary and context.tracker.final_summary.report_path:
+        typer.echo(f"Report: {context.tracker.final_summary.report_path}")
 
 
 @app.command()

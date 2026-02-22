@@ -14,6 +14,7 @@ from teco.knowledge.schema import (
     Strategy,
     StrategyTree,
 )
+from teco.reporting.tracker import ProgressTracker
 from teco.tools.profiler import HardwareCeilings
 
 
@@ -56,8 +57,12 @@ class OptimizationContext:
     run_id: str = ""
     ncu_output_dir: Path = field(default_factory=lambda: Path("knowledge/runs/ncu"))
 
+    # ── Progress tracking ─────────────────────────────────────────────────────
+    tracker: ProgressTracker = field(default_factory=ProgressTracker)
+
     # ── Misc ─────────────────────────────────────────────────────────────────
     verbosity: int = 1  # 0=quiet  1=normal  2=verbose  3=debug
+    generate_report: bool = True  # whether to produce an HTML report after the run
     extra: dict[str, Any] = field(default_factory=dict)
 
     def log(self, msg: str, level: int = 1) -> None:

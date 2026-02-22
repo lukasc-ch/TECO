@@ -71,7 +71,7 @@ class OptimizerAgent(BaseAgent):
         self.ncu_output_dir = ncu_output_dir or Path("knowledge/runs/ncu")
 
     def run(self, context: OptimizationContext) -> OptimizationContext:
-        context.log(f"[OptimizerAgent] Starting optimization: {context.task_name}")
+        tracker = context.tracker
 
         # ── INIT ─────────────────────────────────────────────────────────────
         context = self._init_phase(context)
@@ -92,7 +92,8 @@ class OptimizerAgent(BaseAgent):
     # ------------------------------------------------------------------
 
     def _init_phase(self, context: OptimizationContext) -> OptimizationContext:
-        context.log("[OptimizerAgent] Phase: INIT — profiling baseline")
+        tracker = context.tracker
+        tracker.emit_phase("INIT", "Profiling baseline")
 
         # Show initial kernel source (level 2)
         src_lines = context.kernel_source.splitlines()
@@ -107,8 +108,6 @@ class OptimizerAgent(BaseAgent):
         # Stage 1: latency across shape sweep
         baseline_s1: dict[str, dict[str, float]] = {}
         for shape in context.shape_sweep:
-            # The agent will generate a make_fn via tool call in practice;
-            # here we define the protocol — runner scripts handle actual execution
             metrics = self._profile_stage1_subprocess(
                 context.kernel_source, shape, context
             )
@@ -126,14 +125,32 @@ class OptimizerAgent(BaseAgent):
                 context.kernel_source, medium_shape, context, label="baseline_medium"
             )
             if report is not None:
-                # Merge Stage 1 metrics into Stage 2 report
                 s1 = baseline_s1.get(medium_shape.label, {})
                 flops, nbytes = self._estimate_flops_bytes(context, medium_shape)
                 report = merge_stage1_into_report(report, s1, flops, nbytes)
                 context.baseline_stage2[medium_shape.label] = report
                 context.log(_fmt_report(report), level=3)
 
-        # Print baseline performance table (level 1)
+        # Emit baseline events to tracker (triggers console reporter table)
+        for shape in context.shape_sweep:
+            m = baseline_s1.get(shape.label, {})
+            bn = None
+            rep = context.baseline_stage2.get(shape.label)
+            if rep:
+                bn = rep.bottleneck
+            tracker.emit_baseline(
+                shape_label=shape.label,
+                latency_ms=m.get("latency_ms", 0.0),
+                tflops=m.get("tflops", 0.0),
+                bottleneck=bn,
+            )
+
+        # Flush the baseline table in the console reporter
+        for listener in tracker._listeners:
+            if hasattr(listener, "flush_baseline"):
+                listener.flush_baseline()
+
+        # Also keep legacy table output for backward compat
         context.log(_fmt_baseline_table(context), level=1)
 
         # Extract kernel characteristics from code + profiling
@@ -161,7 +178,8 @@ class OptimizerAgent(BaseAgent):
     # ------------------------------------------------------------------
 
     def _planning_phase(self, context: OptimizationContext) -> OptimizationContext:
-        context.log("[OptimizerAgent] Phase: STRATEGY PLANNING")
+        tracker = context.tracker
+        tracker.emit_phase("PLANNING", "Generating optimization strategies")
 
         system = _SYSTEM_PROMPT.format(language=context.language)
         user = self._build_planning_prompt(context)
@@ -176,6 +194,16 @@ class OptimizerAgent(BaseAgent):
         )
         context.strategy_tree = tree
 
+        # Emit strategy creation events
+        for s in strategies:
+            tracker.emit_strategy(
+                strategy_id=s.id,
+                strategy_name=s.name,
+                action="created",
+                iteration=0,
+                detail=f"conf={s.llm_confidence:.2f}  regime: {s.predicted_winning_regime}",
+            )
+
         context.log(_fmt_strategy_table(strategies), level=2)
 
         return context
@@ -185,9 +213,14 @@ class OptimizerAgent(BaseAgent):
     # ------------------------------------------------------------------
 
     def _iteration_loop(self, context: OptimizationContext) -> OptimizationContext:
+        import time as _time
+
+        tracker = context.tracker
+        tracker.emit_phase("ITERATION", f"Up to {context.max_iterations} iterations")
         consecutive_plateau = 0
 
         for iteration in range(context.max_iterations):
+            iter_start = _time.perf_counter()
             context.iteration = iteration
             context.strategy_tree.iteration = iteration
             context.log(f"\n[OptimizerAgent] Iteration {iteration + 1}/{context.max_iterations}")
@@ -206,9 +239,24 @@ class OptimizerAgent(BaseAgent):
             leader = max(active, key=lambda s: s.llm_confidence)
             context.log(f"  Leading strategy: [{leader.id}] {leader.name} (confidence {leader.llm_confidence:.2f})")
 
+            tracker.emit_strategy(
+                leader.id, leader.name, "deepened", iteration,
+                f"confidence={leader.llm_confidence:.2f}",
+            )
+
             new_source, diff = self._deepen_strategy(leader, context)
             if not new_source:
                 context.log(f"  Failed to generate new code for [{leader.id}]. Skipping iteration.")
+                tracker.record_iteration(
+                    iteration=iteration,
+                    strategy_id=leader.id,
+                    strategy_name=leader.name,
+                    shape_results={},
+                    vs_baseline={},
+                    compile_ok=False,
+                    correctness_ok=False,
+                    wall_time_s=_time.perf_counter() - iter_start,
+                )
                 continue
 
             # Show proposed diff before compile (level 2)
@@ -228,6 +276,19 @@ class OptimizerAgent(BaseAgent):
                 context.log(f"  Compile check failed: {msg}")
                 leader.llm_confidence = max(0.0, leader.llm_confidence - 0.15)
                 leader.last_failure = f"Compile error:\n{msg}"
+                tracker.emit_strategy(
+                    leader.id, leader.name, "compile_failed", iteration, msg[:120],
+                )
+                tracker.record_iteration(
+                    iteration=iteration,
+                    strategy_id=leader.id,
+                    strategy_name=leader.name,
+                    shape_results={},
+                    vs_baseline={},
+                    compile_ok=False,
+                    correctness_ok=False,
+                    wall_time_s=_time.perf_counter() - iter_start,
+                )
                 continue
 
             # 4. Correctness validation
@@ -237,6 +298,19 @@ class OptimizerAgent(BaseAgent):
                 context.log(f"  Correctness validation failed: {msg}")
                 leader.llm_confidence = max(0.0, leader.llm_confidence - 0.20)
                 leader.last_failure = f"Correctness validation failed:\n{msg}"
+                tracker.emit_strategy(
+                    leader.id, leader.name, "correctness_failed", iteration, msg[:120],
+                )
+                tracker.record_iteration(
+                    iteration=iteration,
+                    strategy_id=leader.id,
+                    strategy_name=leader.name,
+                    shape_results={},
+                    vs_baseline={},
+                    compile_ok=True,
+                    correctness_ok=False,
+                    wall_time_s=_time.perf_counter() - iter_start,
+                )
                 continue
 
             leader.last_failure = ""  # clear on success
@@ -251,6 +325,20 @@ class OptimizerAgent(BaseAgent):
             best_tflops = max((r.achieved_tflops for r in shape_results), default=0.0)
             context.log(f"  Best TFLOPS this iteration: {best_tflops:.1f}")
             context.log(_fmt_shape_results(shape_results), level=2)
+
+            # Emit iteration result to tracker
+            shape_dict = {r.shape_point.label: r.achieved_tflops for r in shape_results}
+            vs_dict = {r.shape_point.label: r.vs_baseline_pct for r in shape_results}
+            tracker.record_iteration(
+                iteration=iteration,
+                strategy_id=leader.id,
+                strategy_name=leader.name,
+                shape_results=shape_dict,
+                vs_baseline=vs_dict,
+                compile_ok=True,
+                correctness_ok=True,
+                wall_time_s=_time.perf_counter() - iter_start,
+            )
 
             # 6. Check efficiency ceiling
             eff = context.efficiency_pct(best_tflops)
@@ -275,18 +363,30 @@ class OptimizerAgent(BaseAgent):
     # ------------------------------------------------------------------
 
     def _finalise(self, context: OptimizationContext) -> OptimizationContext:
-        context.log("\n[OptimizerAgent] Phase: FINALISE")
+        tracker = context.tracker
+        tracker.emit_phase("FINALISE", "Selecting regime winners and generating report")
 
         tree = context.strategy_tree
         # Mark regime winners from strategies with shape results
         for strategy in tree.strategies:
             if strategy.shape_results and strategy.status == "active":
-                # Determine if this strategy wins any regime
                 regime = self._determine_winning_regime(strategy, context)
                 if regime:
                     strategy.status = "regime_winner"
                     strategy.winning_shape_range = regime
                     tree.regime_winners[strategy.id] = regime.description
+                    tracker.emit_strategy(
+                        strategy.id, strategy.name, "regime_winner",
+                        context.iteration, regime.description,
+                    )
+
+        # Emit pruned strategy events
+        for strategy in tree.strategies:
+            if strategy.status == "pruned":
+                tracker.emit_strategy(
+                    strategy.id, strategy.name, "pruned",
+                    context.iteration, strategy.prune_reason or "",
+                )
 
         # Stage 2 ncu on each regime winner at its best shape
         regime_winners = [s for s in tree.strategies if s.status == "regime_winner"]
@@ -388,6 +488,31 @@ class OptimizerAgent(BaseAgent):
 
         context.log(f"\n[OptimizerAgent] Done. Overall speedup: {overall_speedup:.2f}x")
         context.log(f"  Run record: knowledge/runs/{run_record.id}.json")
+
+        # Emit final summary to tracker (triggers console reporter panel)
+        tracker.emit_final(
+            overall_speedup=overall_speedup,
+            regime_winners=[
+                {
+                    "id": s.id,
+                    "name": s.name,
+                    "regime": s.winning_shape_range.description if s.winning_shape_range else "all",
+                    "tflops": f"{max((r.achieved_tflops for r in s.shape_results), default=0.0):.1f}",
+                }
+                for s in regime_winners
+            ],
+            pruned_strategies=[
+                {
+                    "id": s.id,
+                    "name": s.name,
+                    "reason": s.prune_reason or "unknown",
+                }
+                for s in tree.strategies
+                if s.status == "pruned"
+            ],
+            total_iterations=context.iteration + 1,
+        )
+
         return context
 
     # ------------------------------------------------------------------
